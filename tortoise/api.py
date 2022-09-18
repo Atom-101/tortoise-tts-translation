@@ -18,10 +18,12 @@ from tortoise.models.arch_util import TorchMelSpectrogram
 from tortoise.models.clvp import CLVP
 from tortoise.models.random_latent_generator import RandomLatentConverter
 from tortoise.models.vocoder import UnivNetGenerator
-from tortoise.utils.audio import wav_to_univnet_mel, denormalize_tacotron_mel
+from tortoise.utils.audio import wav_to_univnet_mel, denormalize_tacotron_mel, normalize_tacotron_mel
 from tortoise.utils.diffusion import SpacedDiffusion, space_timesteps, get_named_beta_schedule
 from tortoise.utils.tokenizer import VoiceBpeTokenizer
 from tortoise.utils.wav2vec_alignment import Wav2VecAlignment
+
+from tortoise.translation_model.model import TranslationModel
 
 pbar = None
 
@@ -160,12 +162,22 @@ def classify_audio_clip(clip):
     return results[0][0]
 
 
+def clip_denormed_mel(mel):
+    mel_sum = (mel[0] > -1).sum(0)
+    
+    for i, m in enumerate(torch.flip(mel_sum > 80, [0])):
+        if not m:
+            break
+    return mel[...,:(-1-i)]
+
+
 class TextToSpeech:
     """
     Main entry point into Tortoise.
     """
 
-    def __init__(self, autoregressive_batch_size=16, models_dir='.models', enable_redaction=True):
+    def __init__(self, autoregressive_batch_size=16, models_dir='.models', enable_redaction=True, 
+                 translation_model_path=None):
         """
         Constructor
         :param autoregressive_batch_size: Specifies how many samples to generate per batch. Lower this if you are seeing
@@ -211,12 +223,21 @@ class TextToSpeech:
         self.cvvp.load_state_dict(torch.load(f'{models_dir}/cvvp.pth'))
 
         self.vocoder = UnivNetGenerator().cpu()
-        self.vocoder.load_state_dict(torch.load(f'{models_dir}/vocoder.pth')['model_g'])
+        self.vocoder.load_state_dict(torch.load(f'{models_dir}/vocoder.pth', map_location=torch.device('cpu'))['model_g'])
         self.vocoder.eval(inference=True)
 
         # Random latent generators (RLGs) are loaded lazily.
         self.rlg_auto = None
         self.rlg_diffusion = None
+        
+        # new translation model
+        if translation_model_path is not None:
+            self.use_translation = True
+            self.translation_model = TranslationModel(4)
+            self.translation_model.load_state_dict(torch.load(translation_model_path, map_location=torch.device('cpu')))
+        else:
+            self.use_translation = False
+            
 
     def get_conditioning_latents(self, voice_samples, return_mels=False):
         """
@@ -346,6 +367,8 @@ class TextToSpeech:
         text_tokens = torch.IntTensor(self.tokenizer.encode(text)).unsqueeze(0).cuda()
         text_tokens = F.pad(text_tokens, (0, 1))  # This may not be necessary.
         assert text_tokens.shape[-1] < 400, 'Too much text provided. Break the text up into separate segments and re-try inference.'
+        if self.use_translation:
+            text_lats = self.autoregressive.text_embedding(text_tokens.cpu())
 
         auto_conds = None
         if voice_samples is not None:
@@ -365,6 +388,7 @@ class TextToSpeech:
             stop_mel_token = self.autoregressive.stop_mel_token
             calm_token = 83  # This is the token for coding silence, which is fixed in place with "fix_autoregressive_output"
             self.autoregressive = self.autoregressive.cuda()
+            # import pdb; pdb.set_trace()
             if verbose:
                 print("Generating autoregressive samples..")
             for b in tqdm(range(num_batches), disable=not verbose):
@@ -399,6 +423,7 @@ class TextToSpeech:
                     clip_results.append(clvp * clvp_cvvp_slider + cvvp * (1-clvp_cvvp_slider))
                 else:
                     clip_results.append(clvp)
+            # import pdb; pdb.set_trace()
             clip_results = torch.cat(clip_results, dim=0)
             samples = torch.cat(samples, dim=0)
             best_results = samples[torch.topk(clip_results, k=k).indices]
@@ -439,8 +464,17 @@ class TextToSpeech:
 
                 mel = do_spectrogram_diffusion(self.diffusion, diffuser, latents, diffusion_conditioning,
                                                temperature=diffusion_temperature, verbose=verbose)
+                if self.use_translation:
+                    if verbose:
+                        print("Translating audio..")
+                    # import pdb; pdb.set_trace()
+                    self.translation_model.cuda()
+                    mel = self.translation_model(normalize_tacotron_mel(mel.cuda()), text_lats.cuda())
+                    mel = clip_denormed_mel(denormalize_tacotron_mel(mel))
+                    self.translation_model.cpu()
                 wav = self.vocoder.inference(mel)
                 wav_candidates.append(wav.cpu())
+            # import pdb; pdb.set_trace()
             self.diffusion = self.diffusion.cpu()
             self.vocoder = self.vocoder.cpu()
 
